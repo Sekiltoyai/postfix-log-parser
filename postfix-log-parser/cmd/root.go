@@ -11,7 +11,6 @@ import (
 	"errors"
 	"net/http"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"os/signal"
@@ -27,55 +26,10 @@ import (
 
 func init() {}
 
-type (
-	PostfixLogParser struct {
-		Time           *time.Time `json:"time"`
-		Hostname       string     `json:"hostname"`
-		Process        string     `json:"process"`
-		QueueId        string     `json:"queue_id"`
-		ClientHostname string     `json:"client_hostname"`
-		ClinetIp       string     `json:"client_ip"`
-		SaslMethod     string     `json:"sasl_method"`
-		SaslUsername   string     `json:"sasl_username"`
-		MessageId      string     `json:"message_id"`
-		From           string     `json:"from"`
-		Size           string     `json:"size"`
-		NRcpt          string     `json:"nrcpt"`
-		Messages       []Message  `json:"messages"`
-	}
-
-	Message struct {
-		Time     *time.Time `json:"time"`
-		To       string     `json:"to"`
-		Status   string     `json:"status"`
-		Message  string     `json:"message"`
-		BounceId string     `json:"bounce_id"`
-	}
-
-	PostfixLogParserFlat struct {
-		Time           *time.Time `json:"time"`
-		Hostname       string     `json:"hostname"`
-		Process        string     `json:"process"`
-		QueueId        string     `json:"queue_id"`
-		ClientHostname string     `json:"client_hostname"`
-		ClinetIp       string     `json:"client_ip"`
-		SaslMethod     string     `json:"sasl_method"`
-		SaslUsername   string     `json:"sasl_username"`
-		MessageId      string     `json:"message_id"`
-		From           string     `json:"from"`
-		Size           string     `json:"size"`
-		NRcpt          string     `json:"nrcpt"`
-		TimeSent       *time.Time `json:"time_sent"`
-		To             string     `json:"to"`
-		Status         string     `json:"status"`
-		Message        string     `json:"message"`
-		BounceId       string     `json:"bounce_id"`
-	}
-)
-
 var (
 	File   os.File
 	Writer *bufio.Writer
+	outfMtx sync.Mutex
 
 	Version = "1.4.5"
 
@@ -157,33 +111,6 @@ func Execute() {
 	}
 }
 
-func PlpToFlat(plp *PostfixLogParser) []PostfixLogParserFlat {
-	var plpf = make([]PostfixLogParserFlat, len(plp.Messages))
-
-	for i := range plp.Messages {
-		plpf[i] = PostfixLogParserFlat{
-			Time:           plp.Time,
-			Hostname:       plp.Hostname,
-			Process:        plp.Process,
-			QueueId:        plp.QueueId,
-			ClientHostname: plp.ClientHostname,
-			ClinetIp:       plp.ClinetIp,
-			SaslMethod:     plp.SaslMethod,
-			SaslUsername:   plp.SaslUsername,
-			MessageId:      plp.MessageId,
-			From:           plp.From,
-			Size:           plp.Size,
-			NRcpt:          plp.NRcpt,
-			TimeSent:       plp.Messages[i].Time,
-			To:             plp.Messages[i].To,
-			Status:         plp.Messages[i].Status,
-			Message:        plp.Messages[i].Message,
-			BounceId:       plp.Messages[i].BounceId,
-		}
-	}
-
-	return plpf
-}
 
 func NewWriter(file string) (*bufio.Writer, *os.File, error) {
 	if len(file) > 0 {
@@ -212,53 +139,67 @@ func writeOut(msg string, filename string) error {
 		return err
 	}
 
-	var tmpPlp PostfixLogParser
+	var tmpPlp postfixlog.PostfixLogParser
 	json.Unmarshal([]byte(msg), &tmpPlp)
 	LineOutCnt.WithLabelValues(tmpPlp.Hostname).Inc()
 
 	return nil
 }
 
-
-// Remove sent, milter-rejected and deferred that entered queue more than "duration" ago
-func cleanMQueue(mqueue map[string]*PostfixLogParser, mqMtx *sync.Mutex, age time.Duration) {
-	var ok int
-
-	log.Printf("Start cleaning queue task: %d items in queue", len(mqueue))
-
-	// We need read lock: fatal error: concurrent map iteration and map write
-	mqMtx.Lock()
-	for qid, inmail := range mqueue {
-		ok = 0
-		// Check all mails were sent (multiple destinations mails)
-		for _, outmail := range inmail.Messages {
-			// Sent and Rejected mails won't have any other event, we can rm
-			if outmail.Status == "sent" || outmail.Status == "milter-reject" || outmail.Status == "postfix-reject" {
-				ok += 1
-			} else if outmail.Status == "deferred" {
-				if inmail.Time.Add(age).Before(time.Now()) {
-					ok += 1
-				}
-			}
-		}
-
-		if ok == len(inmail.Messages) {
-			// We already in rw lock
-			delete(mqueue, qid)
-		}
+func outputCb(value interface{}) error {
+	jsonBytes, err := json.Marshal(value)
+	if err != nil {
+		return err
 	}
-	mqMtx.Unlock()
-	log.Printf("Finished cleaning queue task: %d items in queue", len(mqueue))
+
+	outfMtx.Lock()
+	err = writeOut(string(jsonBytes), gOutputFile)
+	outfMtx.Unlock()
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
+func statsCb(statname string, hostname string, inc bool, value float64) {
+	var c prometheus.Counter
+	switch statname {
+	case "lineincorrectcnt":
+		c = LineIncorrectCnt
+	case "msgincnt":
+		c = MsgInCnt.WithLabelValues(hostname)
+	case "msgdeferredcnt":
+		c = MsgDeferredCnt.WithLabelValues(hostname)
+	case "msgsentcnt":
+		c = MsgSentCnt.WithLabelValues(hostname)
+	case "msgrejectedcnt":
+		c = MsgRejectedCnt.WithLabelValues(hostname)
+	case "msgholdcnt":
+		c = MsgHoldCnt.WithLabelValues(hostname)
+	case "msgbouncedcnt":
+		c = MsgBouncedCnt.WithLabelValues(hostname)
+	case "msgauthfailed":
+		c = MsgAuthFailed.WithLabelValues(hostname)
+	default:
+		return
+	}
+
+	if c != nil {
+		if inc {
+			c.Inc()
+		} else {
+			c.Add(value)
+		}
+	}
+}
 
 // Every 24H, remove sent, milter-rejected and deferred that entered queue more than 5 days ago
-func periodicallyCleanMQueue(mqueue map[string]*PostfixLogParser, mqMtx *sync.Mutex) {
+func periodicallyCleanMQueue(pp *postfixlog.PostfixLogProcessor) {
 	for range time.Tick(time.Hour * 24) {
-		cleanMQueue(mqueue, mqMtx, 5 * 24 * time.Hour)
+		pp.CleanMQueue(5 * 24 * time.Hour)
 	}
 }
-
 
 func initConfig() {}
 
@@ -276,250 +217,8 @@ func init() {
 	cobra.OnInitialize(initConfig)
 }
 
-/*
- * This is the function doing the work.
- * Each input is stored in a map,
- * then written to output when we recognize it as the last line
- */
-func parseStoreAndWrite(input []byte, mq map[string]*PostfixLogParser, mqMtx *sync.Mutex,
-	outfMtx *sync.Mutex, p *postfixlog.PostfixLog) error {
-	logFormat, err := p.Parse(input)
-	if err != nil {
-		// Incorrect line, just skip it
-		if err.Error() == "Error: Line do not match regex" {
-			LineIncorrectCnt.Inc()
-			return err
-		}
-		return err
-	}
-
-	/*
-		Oct 10 04:02:02 mail.example.com postfix/smtpd[22941]: DFBEFDBF00C5: client=example.net[127.0.0.1], sasl_method=PLAIN, sasl_username=user@example.com
-	*/
-	if logFormat.ClientHostname != "" && !strings.HasPrefix(logFormat.Messages, "milter-reject:") {
-		mqMtx.Lock()
-		mq[logFormat.QueueId] = &PostfixLogParser{
-			Time:           logFormat.Time,
-			Hostname:       logFormat.Hostname,
-			Process:        logFormat.Process,
-			QueueId:        logFormat.QueueId,
-			ClientHostname: logFormat.ClientHostname,
-			ClinetIp:       logFormat.ClinetIp,
-			SaslMethod:     logFormat.SaslMethod,
-			SaslUsername:   logFormat.SaslUsername,
-		}
-		mqMtx.Unlock()
-	}
-
-	/*
-		Oct 10 04:02:02 mail.example.com postfix/cleanup[22923]: DFBEFDBF00C5: message-id=<20181009190202.81363306015D@example.com>
-	*/
-	if logFormat.MessageId != "" {
-		mqMtx.Lock()
-		if plp, ok := mq[logFormat.QueueId]; ok {
-			plp.MessageId = logFormat.MessageId
-		}
-		mqMtx.Unlock()
-	}
-
-	/*
-		Oct 10 04:02:03 mail.example.com postfix/qmgr[18719]: DFBEFDBF00C5: from=<root@example.com>, size=3578, nrcpt=1 (queue active)
-	*/
-	if logFormat.From != "" {
-		mqMtx.Lock()
-		if plp, ok := mq[logFormat.QueueId]; ok {
-			plp.From = logFormat.From
-			plp.Size = logFormat.Size
-			plp.NRcpt = logFormat.NRcpt
-		}
-		mqMtx.Unlock()
-		nrcpt, _ := strconv.ParseFloat(logFormat.NRcpt, 64)
-		MsgInCnt.WithLabelValues(logFormat.Hostname).Add(nrcpt)
-	}
-
-	/*
-		Oct 10 04:02:08 mail.example.com postfix/smtp[22928]: DFBEFDBF00C5: to=<test@example-to.com>, relay=mail.example-to.com[192.168.0.10]:25, delay=5.3, delays=0.26/0/0.31/4.7, dsn=2.0.0, status=sent (250 2.0.0 Ok: queued as C598F1B0002D)
-	*/
-	if logFormat.To != "" {
-		mqMtx.Lock()
-		if plp, ok := mq[logFormat.QueueId]; ok {
-			message := Message{
-				Time:     logFormat.Time,
-				To:       logFormat.To,
-				Status:   logFormat.Status,
-				Message:  logFormat.Messages,
-				BounceId: "",
-			}
-			/* When a message is deferred, it won't be written out until it is either sent, expired, or generates a non delivery notification.
-			We want to know instantly when a message is deferred, so we handle this case by emiting output for this message, and not appending this occurence
-			to the list of Messages
-			*/
-			if logFormat.Status == "deferred" {
-				MsgDeferredCnt.WithLabelValues(plp.Hostname).Inc()
-				tmpplp := PostfixLogParser{
-					Time:           plp.Time,
-					Hostname:       plp.Hostname,
-					Process:        plp.Process,
-					QueueId:        plp.QueueId,
-					ClientHostname: plp.ClientHostname,
-					ClinetIp:       plp.ClinetIp,
-					SaslMethod:     plp.SaslMethod,
-					SaslUsername:   plp.SaslUsername,
-					MessageId:      plp.MessageId,
-					From:           plp.From,
-					Size:           plp.Size,
-					NRcpt:          plp.NRcpt,
-				}
-				tmpplp.Messages = append(tmpplp.Messages, message)
-
-				var jsonBytes []byte
-				if gFlatten {
-					jsonBytes, err = json.Marshal(PlpToFlat(&tmpplp)[0])
-				} else {
-					jsonBytes, err = json.Marshal(tmpplp)
-				}
-				if err != nil {
-					log.Fatal(err)
-				}
-				outfMtx.Lock()
-				err = writeOut(string(jsonBytes), gOutputFile)
-				outfMtx.Unlock()
-				if err != nil {
-					log.Fatal(err)
-				}
-				tmpplp.Messages = nil
-				// cannot use nil as type PostfixLogParser in assignment
-				//tmpplp = nil
-			} else {
-				plp.Messages = append(plp.Messages, message)
-			}
-		}
-		mqMtx.Unlock()
-	}
-
-	/*
-		2021-02-05T17:25:03+01:00 mail.example.com postfix/bounce[39258]: 006B056E6: sender non-delivery notification: 642E456E9
-	*/
-	if logFormat.BounceId != "" {
-		mqMtx.Lock()
-		if plp, ok := mq[logFormat.QueueId]; ok {
-			// Get the matching Message by Status=bounced
-			for i, msg := range plp.Messages {
-				// Need to manage more than one bounce for the same queue_id. This is flawy as we just rely on order to match
-				if msg.Status == "bounced" && len(msg.BounceId) == 0 {
-					message := Message{
-						Time:     msg.Time,
-						To:       msg.To,
-						Status:   msg.Status,
-						Message:  msg.Message,
-						BounceId: logFormat.BounceId,
-					}
-					// Delete old message, put new at the end
-					copy(plp.Messages[i:], plp.Messages[i+1:])
-					plp.Messages[len(plp.Messages)-1] = message
-					break
-				}
-			}
-		}
-		mqMtx.Unlock()
-	}
-	/*
-		Oct 10 04:02:08 mail.example.com postfix/qmgr[18719]: DFBEFDBF00C5: removed
-			or
-		2021-02-05T14:17:51+01:00 smtp.server.com postfix/cleanup[38982]: D8C136A3A: milter-reject: END-OF-MESSAGE from unknown[1.2.3.4]: 4.7.1 Greylisting in action, try again later; from=<sender1@sender.com> to=<dest1@example.com> proto=ESMTP helo=<mail.sender.com>
-		    or
-		2023-12-22T09:11:42.627010+01:00 smtp-02.example.org postfix/smtpd[2717] 6CB5F45B78: reject: RCPT from unknown[11.12.13.14]: 450 4.1.2 <mark@distant.domain.nz>: Recipient address rejected: Domain not found; from=<a.user@a.domain.fr> to=<mark@distant.domain.nz> proto=ESMTP helo=<mail.a.domain.fr>
-	*/
-	// "removed" message is end of logs. then flush.
-	if logFormat.Messages == "removed" || strings.HasPrefix(logFormat.Status, "milter-") || strings.EqualFold(logFormat.Status, "postfix-reject") {
-		mqMtx.Lock()
-		if plp, ok := mq[logFormat.QueueId]; ok {
-			for _, plpf := range PlpToFlat(plp) {
-				switch plpf.Status {
-				case "sent":
-					MsgSentCnt.WithLabelValues(plpf.Hostname).Inc()
-				case "milter-reject", "postfix-reject":
-					MsgRejectedCnt.WithLabelValues(plpf.Hostname).Inc()
-				case "milter-hold":
-					MsgHoldCnt.WithLabelValues(plpf.Hostname).Inc()
-				case "bounced":
-					MsgBouncedCnt.WithLabelValues(plpf.Hostname).Inc()
-				}
-
-				if gFlatten {
-					jsonBytes, err := json.Marshal(plpf)
-					if err != nil {
-						log.Fatal(err)
-					}
-					outfMtx.Lock()
-					err = writeOut(string(jsonBytes), gOutputFile)
-					outfMtx.Unlock()
-					if err != nil {
-						log.Fatal(err)
-					}
-				}
-			}
-
-			if !gFlatten {
-				jsonBytes, err := json.Marshal(plp)
-				if err != nil {
-					log.Fatal(err)
-				}
-				outfMtx.Lock()
-				err = writeOut(string(jsonBytes), gOutputFile)
-				outfMtx.Unlock()
-				if err != nil {
-					log.Fatal(err)
-				}
-			}
-		}
-		mqMtx.Unlock()
-	}
-
-	/*
-		2022-06-29T10:55:18.498553+02:00 srv-smtp-01.domain.com postfix/smtpd[75994] warning: unknown[10.11.12.13]: SASL LOGIN authentication failed: authentication failure
-	*/
-	// An auth failed message is not queued, we just write and forget
-	if strings.EqualFold(logFormat.Status, "auth-failed") {
-		MsgAuthFailed.WithLabelValues(logFormat.Hostname).Inc()
-		message := Message{
-			Time:    logFormat.Time,
-			Status:  logFormat.Status,
-			Message: logFormat.Messages,
-		}
-
-		tmpplp := PostfixLogParser{
-			Time:           logFormat.Time,
-			Hostname:       logFormat.Hostname,
-			Process:        logFormat.Process,
-			ClientHostname: logFormat.ClientHostname,
-			ClinetIp:       logFormat.ClinetIp,
-			SaslMethod:     logFormat.SaslMethod,
-		}
-		tmpplp.Messages = append(tmpplp.Messages, message)
-
-		var jsonBytes []byte
-		if gFlatten {
-			jsonBytes, err = json.Marshal(PlpToFlat(&tmpplp)[0])
-		} else {
-			jsonBytes, err = json.Marshal(tmpplp)
-		}
-		if err != nil {
-			log.Fatal(err)
-		}
-		outfMtx.Lock()
-		err = writeOut(string(jsonBytes), gOutputFile)
-		outfMtx.Unlock()
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	return nil
-}
-
-func scanAndProcess(scanner *bufio.Scanner, isStdin bool, conn net.Conn, mQueue map[string]*PostfixLogParser,
-	mqMtx *sync.Mutex, outfMtx *sync.Mutex, p *postfixlog.PostfixLog) error {
+func scanAndProcess(scanner *bufio.Scanner, isStdin bool, conn net.Conn,
+	pp *postfixlog.PostfixLogProcessor) error {
 	for {
 		// If input is made via TCP Conn, we need to read from a connected net.Conn
 		if scanner == nil || (isStdin == false && conn == nil) {
@@ -547,7 +246,7 @@ func scanAndProcess(scanner *bufio.Scanner, isStdin bool, conn net.Conn, mQueue 
 		LineReadCnt.Inc()
 
 		read := scanner.Bytes()
-		err := parseStoreAndWrite(read, mQueue, mqMtx, outfMtx, p)
+		err := pp.ParseStoreAndWrite(read)
 		if err != nil {
 			if err.Error() != "Error: Line do not match regex" {
 				return err
@@ -562,14 +261,7 @@ func scanAndProcess(scanner *bufio.Scanner, isStdin bool, conn net.Conn, mQueue 
 func processLogs(cmd *cobra.Command, args []string) {
 	//var scanner *bufio.Scanner
 	var listener net.Listener
-	// Output file mutex
-	var outfMtx sync.Mutex
-	// mQueue mutex
-	var mqMtx sync.Mutex
 	var useStdin bool
-
-	// create map of messages
-	mQueue := make(map[string]*PostfixLogParser)
 
 	BuildInfo.WithLabelValues(Version, runtime.Version()).Set(1)
 	StartTime.Set(float64(time.Now().Unix()))
@@ -602,7 +294,7 @@ func processLogs(cmd *cobra.Command, args []string) {
 	}
 
 	// initialize
-	p := postfixlog.NewPostfixLog()
+	pp := postfixlog.NewPostfixLogProcessor(outputCb, statsCb, gFlatten)
 
 	// Get a writer, file or stdout
 	_, File, err := NewWriter(gOutputFile)
@@ -635,7 +327,7 @@ func processLogs(cmd *cobra.Command, args []string) {
 	}
 
 	// Cleaner thread
-	go periodicallyCleanMQueue(mQueue, &mqMtx)
+	go periodicallyCleanMQueue(pp)
 
 
 	// On demand Mqueue cleaning... For debug, dont try this at home, kids!
@@ -653,7 +345,7 @@ func processLogs(cmd *cobra.Command, args []string) {
 	if true == strings.EqualFold(gSyslogListenAddress, "do-not-listen") {
 		useStdin = true
 		scanner := bufio.NewScanner(os.Stdin)
-		scanAndProcess(scanner, useStdin, nil, mQueue, &mqMtx, &outfMtx, p)
+		scanAndProcess(scanner, useStdin, nil, pp)
 		// ...or manages incoming connections
 	} else {
 		listener, err = net.Listen("tcp", gSyslogListenAddress)
@@ -669,7 +361,7 @@ func processLogs(cmd *cobra.Command, args []string) {
 			}
 			scanner := bufio.NewScanner(connClt)
 			ConnectedClientCnt.Inc()
-			go scanAndProcess(scanner, useStdin, connClt, mQueue, &mqMtx, &outfMtx, p)
+			go scanAndProcess(scanner, useStdin, connClt, pp)
 			ConnectedClientCnt.Dec()
 		}
 	}
